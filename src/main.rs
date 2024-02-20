@@ -8,11 +8,55 @@ use std::error::Error;
 use std::time::Duration;
 use tokio::time;
 use uuid::Uuid;
+use byteorder::{ByteOrder, BigEndian}; // 1.3.4
+use bitreader::BitReader;
 
 /// Only devices whose name contains this string will be tried.
 const PERIPHERAL_NAME_MATCH_FILTER: &str = "Ruuvi";
 /// UUID of the characteristic for which we should subscribe to notifications.
 const NOTIFY_CHARACTERISTIC_UUID: Uuid = Uuid::from_u128(0x6e400003_b5a3_f393_e0a9_e50e24dcca9e);
+
+#[derive(Debug)]
+struct RuuviData {
+    uuid: Uuid,
+    temperature: f32,
+    humidity: f32,
+    pressure: u32,
+    acceleration_x: f32,
+    acceleration_y: f32,
+    acceleration_z: f32,
+    voltage: f32,
+    tx_power: u16,
+    movement_counter: u8,
+    measurement_sequence: u16,
+}
+
+
+impl RuuviData {
+    fn new(uuid: Uuid, raw_data: Vec<u8>) -> Result<RuuviData, Box<dyn Error>> {
+        let mut reader = BitReader::new(&raw_data);
+        reader.skip(8).unwrap();
+        
+
+        let temperature = reader.read_u16(16)? as f32 * 0.005;
+        let humidity = reader.read_u16(16)? as f32 * 0.0025;
+        let pressure = reader.read_u32(16)? + 50_000;
+        let acceleration_x = reader.read_i16(16)? as f32 / 1000.0;
+        let acceleration_y = reader.read_i16(16)? as f32 / 1000.0;
+        let acceleration_z = reader.read_i16(16)? as f32 / 1000.0;
+        let voltage = reader.read_u16(11)? as f32 * 0.001 + 1.6;
+        let tx_power = reader.read_u16(5)? * 2 - 40;
+        let movement_counter = reader.read_u8(8)?;
+        let measurement_sequence = reader.read_u16(16)?;
+
+        println!("{:?}", raw_data);
+        let rd = RuuviData {uuid, temperature, humidity, pressure, acceleration_x, acceleration_y, acceleration_z, voltage, tx_power, movement_counter, measurement_sequence};
+
+        println!("{:?}", rd);
+        Ok(rd)
+    }
+}
+
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -64,10 +108,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         is_connected, &local_name
                     );
                     if is_connected {
-                        println!("Discover peripheral {:?} services...", local_name);
                         peripheral.discover_services().await?;
                         for characteristic in peripheral.characteristics() {
-                            println!("Checking characteristic {:?}", characteristic);
                             // Subscribe to notifications from the characteristic with the selected
                             // UUID.
                             if characteristic.uuid == NOTIFY_CHARACTERISTIC_UUID
@@ -80,21 +122,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     peripheral.notifications().await?.take(4);
                                 // Process while the BLE connection is not broken or stopped.
                                 while let Some(data) = notification_stream.next().await {
-                                    println!(
-                                        "Received data from {:?} [{:?}]: {:?}",
-                                        local_name, data.uuid, data.value
-                                    );
+                                    let rd = RuuviData::new(data.uuid, data.value.clone());
                                 }
-                            } else {
-                                println!("NAH {} {}", characteristic.uuid, NOTIFY_CHARACTERISTIC_UUID);
-                            }
+                            } 
                         }
                         println!("Disconnecting from peripheral {:?}...", local_name);
                         peripheral.disconnect().await?;
                     }
-                } else {
-                    println!("Skipping unknown peripheral {:?}", peripheral);
-                }
+                }  
             }
         }
     }
