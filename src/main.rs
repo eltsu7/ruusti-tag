@@ -1,6 +1,3 @@
-// See the "macOS permissions note" in README.md before running this on macOS
-// Big Sur or later.
-
 use btleplug::api::{BDAddr, Central, CharPropFlags, Manager as _, Peripheral, ScanFilter};
 use btleplug::platform::Manager;
 use futures::stream::StreamExt;
@@ -31,7 +28,6 @@ struct RuuviData {
     measurement_sequence: u16,
 }
 
-
 impl RuuviData {
     fn new(mac_address: BDAddr, raw_data: Vec<u8>) -> Result<RuuviData, Box<dyn Error>> {
         let mut reader = BitReader::new(&raw_data);
@@ -61,6 +57,7 @@ impl fmt::Display for RuuviData {
     }
 }
 
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     pretty_env_logger::init();
@@ -71,12 +68,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         eprintln!("No Bluetooth adapters found");
         return Ok(());
     }
+    let mut ruuvis: Vec<btleplug::platform::Peripheral> = Vec::new();
 
     let wanted_macs = [
         BDAddr::from_str_delim("F2:2D:EB:37:8A:D4").unwrap(),
         BDAddr::from_str_delim("D3:1A:DA:17:E5:C6").unwrap(),
     ];
-    
+
 
     for adapter in adapter_list.iter() {
         println!("Starting scan...");
@@ -85,81 +83,54 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .await
             .expect("Can't scan BLE adapter for connected devices...");
 
-        'outer: loop {
+        loop {
+            if ruuvis.len() == wanted_macs.len() {
+                break;
+            }
             time::sleep(Duration::from_secs(1)).await;
             let peripherals = adapter_list[0].peripherals().await?;
 
             for mac in wanted_macs {
-                let mut found = false;
                 for peripheral in &peripherals {
                     if peripheral.address() == mac {
-                        found = true;
-                        break;
+                        println!("found {}", mac);
+                        ruuvis.push(peripheral.clone());
                     }
-                }
-                if !found {
-                    println!("{} not found yet...", mac);
-                    continue 'outer;       
                 }
             }
-            break;
-        }
-
-        let peripherals = adapter.peripherals().await?;
-        if peripherals.is_empty() {
-            eprintln!("->>> BLE peripheral devices were not found, sorry. Exiting...");
-            return Ok(());
-        }
-        // All peripheral devices in range.
-        for peripheral in peripherals.iter() {
-            let properties = peripheral.properties().await?;
-            let is_connected = peripheral.is_connected().await?;
-            let local_name = properties
-                .unwrap()
-                .local_name
-                .unwrap_or(String::from("(peripheral name unknown)"));
-            println!(
-                "Peripheral {:?} is connected: {:?}",
-                &local_name, is_connected
-            );
-            // Check if it's the peripheral we want.
-            if local_name.contains(PERIPHERAL_NAME_MATCH_FILTER) {
-                println!("Found matching peripheral {:?}...", &local_name);
-                if !is_connected {
-                    // Connect if we aren't already connected.
-                    if let Err(err) = peripheral.connect().await {
-                        eprintln!("Error connecting to peripheral, skipping: {}", err);
-                        continue;
-                    }
-                }
-                println!(
-                    "Now connected ({:?}) to peripheral {:?}.",
-                    is_connected, &local_name
-                );
-                if is_connected {
-                    peripheral.discover_services().await?;
-                    for characteristic in peripheral.characteristics() {
-                        // Subscribe to notifications from the characteristic with the selected
-                        // UUID.
-                        if characteristic.uuid == NOTIFY_CHARACTERISTIC_UUID
-                        && characteristic.properties.contains(CharPropFlags::NOTIFY)
-                        {
-                            println!("Subscribing to characteristic {:?}", characteristic.uuid);
-                            peripheral.subscribe(&characteristic).await?;
-                            // Print the first 4 notifications received.
-                            let mut notification_stream = peripheral.notifications().await?.take(4);
-                            // Process while the BLE connection is not broken or stopped.
-                            while let Some(data) = notification_stream.next().await {
-                                let rd = RuuviData::new(peripheral.address(), data.value.clone()).unwrap();
-                                println!("{}", rd);
-                            }
-                        } 
-                    }
-                    println!("Disconnecting from peripheral {:?}...", local_name);
-                    peripheral.disconnect().await?;
-                }
-            }  
         }
     }
+    println!("connecting and subscribing..");
+    for ruuvi in ruuvis.iter() {
+        ruuvi.connect().await?;
+        println!("{} connected: {}", ruuvi.address(), ruuvi.is_connected().await?);
+        ruuvi.discover_services().await?;
+        for characteristic in ruuvi.characteristics() {
+            if characteristic.uuid == NOTIFY_CHARACTERISTIC_UUID && characteristic.properties.contains(CharPropFlags::NOTIFY){
+                println!("subbing for {}", ruuvi.address());
+                ruuvi.subscribe(&characteristic).await?;
+                break;
+            }
+        }
+    }
+    println!("starting polling notifications..");
+    let mut i = 1;
+    loop {
+        for ruuvi in ruuvis.iter() {
+            let mut notification = ruuvi.notifications().await?.take(1);
+            if let Some(data) = notification.next().await {
+                println!("{}", RuuviData::new(ruuvi.address(), data.value.clone()).unwrap());
+            }
+        }
+        i += 1;
+        if i > 10 {
+            break;
+        }
+    }
+
+    for ruuvi in ruuvis.iter() {
+        ruuvi.disconnect().await?;
+    }
+    println!("asd");
     Ok(())
 }
