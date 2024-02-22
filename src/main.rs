@@ -1,14 +1,14 @@
 // See the "macOS permissions note" in README.md before running this on macOS
 // Big Sur or later.
 
-use btleplug::api::{Central, CharPropFlags, Manager as _, Peripheral, ScanFilter};
+use btleplug::api::{BDAddr, Central, CharPropFlags, Manager as _, Peripheral, ScanFilter};
 use btleplug::platform::Manager;
 use futures::stream::StreamExt;
+use core::fmt;
 use std::error::Error;
 use std::time::Duration;
 use tokio::time;
 use uuid::Uuid;
-use byteorder::{ByteOrder, BigEndian}; // 1.3.4
 use bitreader::BitReader;
 
 /// Only devices whose name contains this string will be tried.
@@ -18,7 +18,7 @@ const NOTIFY_CHARACTERISTIC_UUID: Uuid = Uuid::from_u128(0x6e400003_b5a3_f393_e0
 
 #[derive(Debug)]
 struct RuuviData {
-    uuid: Uuid,
+    mac_address: BDAddr,
     temperature: f32,
     humidity: f32,
     pressure: u32,
@@ -33,10 +33,10 @@ struct RuuviData {
 
 
 impl RuuviData {
-    fn new(uuid: Uuid, raw_data: Vec<u8>) -> Result<RuuviData, Box<dyn Error>> {
+    fn new(mac_address: BDAddr, raw_data: Vec<u8>) -> Result<RuuviData, Box<dyn Error>> {
         let mut reader = BitReader::new(&raw_data);
         reader.skip(8).unwrap();
-        
+
 
         let temperature = reader.read_u16(16)? as f32 * 0.005;
         let humidity = reader.read_u16(16)? as f32 * 0.0025;
@@ -49,14 +49,17 @@ impl RuuviData {
         let movement_counter = reader.read_u8(8)?;
         let measurement_sequence = reader.read_u16(16)?;
 
-        println!("{:?}", raw_data);
-        let rd = RuuviData {uuid, temperature, humidity, pressure, acceleration_x, acceleration_y, acceleration_z, voltage, tx_power, movement_counter, measurement_sequence};
+        let rd = RuuviData {mac_address, temperature, humidity, pressure, acceleration_x, acceleration_y, acceleration_z, voltage, tx_power, movement_counter, measurement_sequence};
 
-        println!("{:?}", rd);
         Ok(rd)
     }
 }
 
+impl fmt::Display for RuuviData {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Mac: {}, temp: {}, humidity: {}, measurement sequence: {}", self.mac_address, self.temperature, self.humidity, self.measurement_sequence)
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -66,7 +69,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let adapter_list = manager.adapters().await?;
     if adapter_list.is_empty() {
         eprintln!("No Bluetooth adapters found");
+        return Ok(());
     }
+
+    let wanted_macs = [
+        BDAddr::from_str_delim("F2:2D:EB:37:8A:D4").unwrap(),
+        BDAddr::from_str_delim("D3:1A:DA:17:E5:C6").unwrap(),
+    ];
+    
 
     for adapter in adapter_list.iter() {
         println!("Starting scan...");
@@ -74,63 +84,81 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .start_scan(ScanFilter::default())
             .await
             .expect("Can't scan BLE adapter for connected devices...");
-        time::sleep(Duration::from_secs(10)).await;
-        let peripherals = adapter.peripherals().await?;
 
+        'outer: loop {
+            time::sleep(Duration::from_secs(1)).await;
+            let peripherals = adapter_list[0].peripherals().await?;
+
+            for mac in wanted_macs {
+                let mut found = false;
+                for peripheral in &peripherals {
+                    if peripheral.address() == mac {
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    println!("{} not found yet...", mac);
+                    continue 'outer;       
+                }
+            }
+            break;
+        }
+
+        let peripherals = adapter.peripherals().await?;
         if peripherals.is_empty() {
             eprintln!("->>> BLE peripheral devices were not found, sorry. Exiting...");
-        } else {
-            // All peripheral devices in range.
-            for peripheral in peripherals.iter() {
-                let properties = peripheral.properties().await?;
-                let is_connected = peripheral.is_connected().await?;
-                let local_name = properties
-                    .unwrap()
-                    .local_name
-                    .unwrap_or(String::from("(peripheral name unknown)"));
+            return Ok(());
+        }
+        // All peripheral devices in range.
+        for peripheral in peripherals.iter() {
+            let properties = peripheral.properties().await?;
+            let is_connected = peripheral.is_connected().await?;
+            let local_name = properties
+                .unwrap()
+                .local_name
+                .unwrap_or(String::from("(peripheral name unknown)"));
+            println!(
+                "Peripheral {:?} is connected: {:?}",
+                &local_name, is_connected
+            );
+            // Check if it's the peripheral we want.
+            if local_name.contains(PERIPHERAL_NAME_MATCH_FILTER) {
+                println!("Found matching peripheral {:?}...", &local_name);
+                if !is_connected {
+                    // Connect if we aren't already connected.
+                    if let Err(err) = peripheral.connect().await {
+                        eprintln!("Error connecting to peripheral, skipping: {}", err);
+                        continue;
+                    }
+                }
                 println!(
-                    "Peripheral {:?} is connected: {:?}",
-                    &local_name, is_connected
+                    "Now connected ({:?}) to peripheral {:?}.",
+                    is_connected, &local_name
                 );
-                // Check if it's the peripheral we want.
-                if local_name.contains(PERIPHERAL_NAME_MATCH_FILTER) {
-                    println!("Found matching peripheral {:?}...", &local_name);
-                    if !is_connected {
-                        // Connect if we aren't already connected.
-                        if let Err(err) = peripheral.connect().await {
-                            eprintln!("Error connecting to peripheral, skipping: {}", err);
-                            continue;
-                        }
+                if is_connected {
+                    peripheral.discover_services().await?;
+                    for characteristic in peripheral.characteristics() {
+                        // Subscribe to notifications from the characteristic with the selected
+                        // UUID.
+                        if characteristic.uuid == NOTIFY_CHARACTERISTIC_UUID
+                        && characteristic.properties.contains(CharPropFlags::NOTIFY)
+                        {
+                            println!("Subscribing to characteristic {:?}", characteristic.uuid);
+                            peripheral.subscribe(&characteristic).await?;
+                            // Print the first 4 notifications received.
+                            let mut notification_stream = peripheral.notifications().await?.take(4);
+                            // Process while the BLE connection is not broken or stopped.
+                            while let Some(data) = notification_stream.next().await {
+                                let rd = RuuviData::new(peripheral.address(), data.value.clone()).unwrap();
+                                println!("{}", rd);
+                            }
+                        } 
                     }
-                    let is_connected = peripheral.is_connected().await?;
-                    println!(
-                        "Now connected ({:?}) to peripheral {:?}.",
-                        is_connected, &local_name
-                    );
-                    if is_connected {
-                        peripheral.discover_services().await?;
-                        for characteristic in peripheral.characteristics() {
-                            // Subscribe to notifications from the characteristic with the selected
-                            // UUID.
-                            if characteristic.uuid == NOTIFY_CHARACTERISTIC_UUID
-                                && characteristic.properties.contains(CharPropFlags::NOTIFY)
-                            {
-                                println!("Subscribing to characteristic {:?}", characteristic.uuid);
-                                peripheral.subscribe(&characteristic).await?;
-                                // Print the first 4 notifications received.
-                                let mut notification_stream =
-                                    peripheral.notifications().await?.take(4);
-                                // Process while the BLE connection is not broken or stopped.
-                                while let Some(data) = notification_stream.next().await {
-                                    let rd = RuuviData::new(data.uuid, data.value.clone());
-                                }
-                            } 
-                        }
-                        println!("Disconnecting from peripheral {:?}...", local_name);
-                        peripheral.disconnect().await?;
-                    }
-                }  
-            }
+                    println!("Disconnecting from peripheral {:?}...", local_name);
+                    peripheral.disconnect().await?;
+                }
+            }  
         }
     }
     Ok(())
