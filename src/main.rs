@@ -1,12 +1,12 @@
+use bitreader::BitReader;
 use btleplug::api::{BDAddr, Central, CharPropFlags, Manager as _, Peripheral, ScanFilter};
 use btleplug::platform::Manager;
-use futures::stream::StreamExt;
 use core::fmt;
+use futures::stream::StreamExt;
 use std::error::Error;
 use std::time::Duration;
 use tokio::time;
 use uuid::Uuid;
-use bitreader::BitReader;
 
 /// Only devices whose name contains this string will be tried.
 const PERIPHERAL_NAME_MATCH_FILTER: &str = "Ruuvi";
@@ -33,7 +33,6 @@ impl RuuviData {
         let mut reader = BitReader::new(&raw_data);
         reader.skip(8).unwrap();
 
-
         let temperature = reader.read_u16(16)? as f32 * 0.005;
         let humidity = reader.read_u16(16)? as f32 * 0.0025;
         let pressure = reader.read_u32(16)? + 50_000;
@@ -45,18 +44,30 @@ impl RuuviData {
         let movement_counter = reader.read_u8(8)?;
         let measurement_sequence = reader.read_u16(16)?;
 
-        let rd = RuuviData {mac_address, temperature, humidity, pressure, acceleration_x, acceleration_y, acceleration_z, voltage, tx_power, movement_counter, measurement_sequence};
-
-        Ok(rd)
+        Ok(RuuviData {
+            mac_address,
+            temperature,
+            humidity,
+            pressure,
+            acceleration_x,
+            acceleration_y,
+            acceleration_z,
+            voltage,
+            tx_power,
+            movement_counter,
+            measurement_sequence,
+        })
     }
 }
-
 impl fmt::Display for RuuviData {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Mac: {}, temp: {}, humidity: {}, measurement sequence: {}", self.mac_address, self.temperature, self.humidity, self.measurement_sequence)
+        write!(
+            f,
+            "Mac: {}, temp: {}, humidity: {}, measurement sequence: {}",
+            self.mac_address, self.temperature, self.humidity, self.measurement_sequence
+        )
     }
 }
-
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -75,7 +86,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         BDAddr::from_str_delim("D3:1A:DA:17:E5:C6").unwrap(),
     ];
 
-
     for adapter in adapter_list.iter() {
         println!("Starting scan...");
         adapter
@@ -93,37 +103,51 @@ async fn main() -> Result<(), Box<dyn Error>> {
             for mac in wanted_macs {
                 for peripheral in &peripherals {
                     if peripheral.address() == mac {
-                        println!("found {}", mac);
-                        ruuvis.push(peripheral.clone());
+                        if !ruuvis
+                            .iter()
+                            .any(|ruuvi| ruuvi.address() == peripheral.address())
+                        {
+                            println!("found {}", mac);
+                            ruuvis.push(peripheral.clone());
+                        }
                     }
                 }
             }
         }
     }
-    println!("connecting and subscribing..");
+    println!("Connecting and subscribing..");
     for ruuvi in ruuvis.iter() {
         ruuvi.connect().await?;
-        println!("{} connected: {}", ruuvi.address(), ruuvi.is_connected().await?);
         ruuvi.discover_services().await?;
         for characteristic in ruuvi.characteristics() {
-            if characteristic.uuid == NOTIFY_CHARACTERISTIC_UUID && characteristic.properties.contains(CharPropFlags::NOTIFY){
-                println!("subbing for {}", ruuvi.address());
+            if characteristic.uuid == NOTIFY_CHARACTERISTIC_UUID
+                && characteristic.properties.contains(CharPropFlags::NOTIFY)
+            {
                 ruuvi.subscribe(&characteristic).await?;
                 break;
             }
         }
+        println!(
+            "Ruuvi {} connected: {}",
+            ruuvi.address(),
+            ruuvi.is_connected().await?
+        );
     }
-    println!("starting polling notifications..");
+    println!("\nStarting polling notifications..");
     let mut i = 1;
     loop {
         for ruuvi in ruuvis.iter() {
             let mut notification = ruuvi.notifications().await?.take(1);
             if let Some(data) = notification.next().await {
-                println!("{}", RuuviData::new(ruuvi.address(), data.value.clone()).unwrap());
+                println!(
+                    "{}",
+                    RuuviData::new(ruuvi.address(), data.value.clone()).unwrap()
+                );
             }
         }
+        time::sleep(Duration::from_secs(10)).await;
         i += 1;
-        if i > 10 {
+        if i > 5 {
             break;
         }
     }
@@ -131,6 +155,5 @@ async fn main() -> Result<(), Box<dyn Error>> {
     for ruuvi in ruuvis.iter() {
         ruuvi.disconnect().await?;
     }
-    println!("asd");
     Ok(())
 }
