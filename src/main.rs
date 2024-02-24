@@ -8,8 +8,6 @@ use std::time::Duration;
 use tokio::time;
 use uuid::Uuid;
 
-/// Only devices whose name contains this string will be tried.
-const PERIPHERAL_NAME_MATCH_FILTER: &str = "Ruuvi";
 /// UUID of the characteristic for which we should subscribe to notifications.
 const NOTIFY_CHARACTERISTIC_UUID: Uuid = Uuid::from_u128(0x6e400003_b5a3_f393_e0a9_e50e24dcca9e);
 
@@ -135,25 +133,35 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     println!("\nStarting polling notifications..");
     let mut i = 1;
+    use std::time::Instant;
     loop {
-        for ruuvi in ruuvis.iter() {
-            let mut notification = ruuvi.notifications().await?.take(1);
-            if let Some(data) = notification.next().await {
-                println!(
-                    "{}",
-                    RuuviData::new(ruuvi.address(), data.value.clone()).unwrap()
-                );
-            }
-        }
+        let now = Instant::now();
+        read_data(&ruuvis).await;
         time::sleep(Duration::from_secs(10)).await;
         i += 1;
-        if i > 5 {
-            break;
-        }
+        let elapsed = now.elapsed();
+        println!("Elapsed: {:.2?}", elapsed);
+        // if i > 5 {
+        //     break;
+        // }
     }
 
     for ruuvi in ruuvis.iter() {
         ruuvi.disconnect().await?;
     }
     Ok(())
+}
+
+async fn read_data(ruuvis: &Vec::<btleplug::platform::Peripheral>) {
+    for ruuvi in ruuvis.iter() {
+        if let Ok(mut notification) = ruuvi.notifications().await {
+            if let Some(data) = notification.next().await {
+
+                println!(
+                    "{}",
+                    RuuviData::new(ruuvi.address(), data.value.clone()).unwrap()
+                );
+            }
+        }
+    }
 }
