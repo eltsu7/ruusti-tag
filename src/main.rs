@@ -1,12 +1,17 @@
 use bitreader::BitReader;
 use btleplug::api::{BDAddr, Central, CharPropFlags, Manager as _, Peripheral, ScanFilter};
 use btleplug::platform::Manager;
-use core::fmt;
-use futures::stream::StreamExt;
+use core::{f64, fmt};
+use std::collections::HashMap;
+use dotenv::dotenv;
+use futures::stream::{self, StreamExt};
+use influxdb2::Client;
 use std::error::Error;
 use std::time::Duration;
-use tokio::time;
+use tokio::{fs, time};
 use uuid::Uuid;
+use serde::Deserialize;
+use serde_json;
 
 /// UUID of the characteristic for which we should subscribe to notifications.
 const NOTIFY_CHARACTERISTIC_UUID: Uuid = Uuid::from_u128(0x6e400003_b5a3_f393_e0a9_e50e24dcca9e);
@@ -67,101 +72,162 @@ impl fmt::Display for RuuviData {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    pretty_env_logger::init();
+#[derive(Deserialize)]
+struct Config {
+    influx_bucket: String,
+    influx_host: String,
+    influx_org: String,
+    influx_token: String,
+    tags: HashMap<String, String>,
+}
 
-    let manager = Manager::new().await?;
-    let adapter_list = manager.adapters().await?;
-    if adapter_list.is_empty() {
-        eprintln!("No Bluetooth adapters found");
-        return Ok(());
+struct RustSniffer {
+    influx_client: Client,
+    influx_bucket: String,
+    tag_names: HashMap<String, BDAddr>,
+    ruuvis: Vec<btleplug::platform::Peripheral>,
+}
+
+impl RustSniffer {
+    async fn new(config: Config) -> RustSniffer {
+        let mut tag_names: HashMap<String, BDAddr> = HashMap::new();
+
+        for (name, mac) in config.tags {
+            tag_names.insert(name, BDAddr::from_str_delim(&mac).unwrap());
+        };
+
+
+        RustSniffer {
+            influx_client: Client::new(config.influx_host, config.influx_org, config.influx_token),
+            influx_bucket: config.influx_bucket,
+            ruuvis: Vec::new(),
+            tag_names,
+        }
     }
-    let mut ruuvis: Vec<btleplug::platform::Peripheral> = Vec::new();
 
-    let wanted_macs = [
-        BDAddr::from_str_delim("F2:2D:EB:37:8A:D4").unwrap(),
-        BDAddr::from_str_delim("D3:1A:DA:17:E5:C6").unwrap(),
-    ];
+    async fn discover(&mut self) -> Result<(), Box<dyn Error>>{
+        let manager = Manager::new().await?;
+        let adapter_list = manager.adapters().await?;
+        if adapter_list.is_empty() {
+            eprintln!("No Bluetooth adapters found");
+            return Ok(());
+        }
 
-    for adapter in adapter_list.iter() {
-        println!("Starting scan...");
-        adapter
-            .start_scan(ScanFilter::default())
-            .await
-            .expect("Can't scan BLE adapter for connected devices...");
+        for adapter in adapter_list.iter() {
+            println!("Starting scan...");
+            adapter
+                .start_scan(ScanFilter::default())
+                .await
+                .expect("Can't scan BLE adapter for connected devices...");
 
-        loop {
-            if ruuvis.len() == wanted_macs.len() {
-                break;
-            }
-            time::sleep(Duration::from_secs(1)).await;
-            let peripherals = adapter_list[0].peripherals().await?;
+            loop {
+                if self.tag_names.len() == self.ruuvis.len() {
+                    break;
+                }
+                time::sleep(Duration::from_secs(1)).await;
+                let peripherals = adapter_list[0].peripherals().await?;
 
-            for mac in wanted_macs {
-                for peripheral in &peripherals {
-                    if peripheral.address() == mac {
-                        if !ruuvis
-                            .iter()
-                            .any(|ruuvi| ruuvi.address() == peripheral.address())
-                        {
-                            println!("found {}", mac);
-                            ruuvis.push(peripheral.clone());
+                for (_name, mac) in &self.tag_names {
+                    for peripheral in &peripherals {
+                        if peripheral.address() == *mac {
+                            if !self.ruuvis
+                                .iter()
+                                .any(|ruuvi| ruuvi.address() == peripheral.address())
+                            {
+                                println!("found {}", mac);
+                                self.ruuvis.push(peripheral.clone());
+                            }
                         }
                     }
                 }
             }
         }
-    }
-    println!("Connecting and subscribing..");
-    for ruuvi in ruuvis.iter() {
-        ruuvi.connect().await?;
-        ruuvi.discover_services().await?;
-        for characteristic in ruuvi.characteristics() {
-            if characteristic.uuid == NOTIFY_CHARACTERISTIC_UUID
-                && characteristic.properties.contains(CharPropFlags::NOTIFY)
-            {
-                ruuvi.subscribe(&characteristic).await?;
-                break;
+        println!("Connecting and subscribing..");
+        for ruuvi in self.ruuvis.iter() {
+            ruuvi.connect().await?;
+            ruuvi.discover_services().await?;
+            for characteristic in ruuvi.characteristics() {
+                if characteristic.uuid == NOTIFY_CHARACTERISTIC_UUID
+                    && characteristic.properties.contains(CharPropFlags::NOTIFY)
+                {
+                    ruuvi.subscribe(&characteristic).await?;
+                    break;
+                }
             }
+            println!(
+                "Ruuvi {} connected: {}",
+                ruuvi.address(),
+                ruuvi.is_connected().await?
+            );
         }
-        println!(
-            "Ruuvi {} connected: {}",
-            ruuvi.address(),
-            ruuvi.is_connected().await?
-        );
-    }
-    println!("\nStarting polling notifications..");
-    let mut i = 1;
-    use std::time::Instant;
-    loop {
-        let now = Instant::now();
-        read_data(&ruuvis).await;
-        time::sleep(Duration::from_secs(10)).await;
-        i += 1;
-        let elapsed = now.elapsed();
-        println!("Elapsed: {:.2?}", elapsed);
-        // if i > 5 {
-        //     break;
-        // }
+        Ok(())
     }
 
-    for ruuvi in ruuvis.iter() {
-        ruuvi.disconnect().await?;
+    async fn start(&mut self) -> Result<(), Box<dyn Error>> {
+        self.discover().await?;
+        println!("\nStarting polling notifications..");
+        use std::time::Instant;
+        loop {
+            let now = Instant::now();
+            self.update_data().await?;
+            time::sleep(Duration::from_secs(10)).await;
+            let elapsed = now.elapsed();
+            println!("Elapsed: {:.2?}", elapsed);
+        }
     }
-    Ok(())
+
+    async fn update_data(
+        &self
+    ) -> Result<(), Box<dyn Error>> {
+        println!("Reading data...");
+        let mut ruuvi_datas: Vec<RuuviData> = Vec::new();
+        for ruuvi in self.ruuvis.iter() {
+            if let Ok(mut notification) = ruuvi.notifications().await {
+                if let Some(data) = notification.next().await {
+                    ruuvi_datas.push(RuuviData::new(ruuvi.address(), data.value.clone()).unwrap());
+                }
+            }
+        }
+        self.send_data(ruuvi_datas).await?;
+        Ok(())
+    }
+
+    async fn send_data(&self, ruuvi_datas: Vec<RuuviData>) -> Result<(), Box<dyn Error>> {
+        use influxdb2::models::DataPoint;
+
+        let mut points: Vec<DataPoint> = Vec::new();
+        for data in ruuvi_datas {
+            points.push(
+                DataPoint::builder("ruuvi_measurements_test")
+                    .tag("mac", data.mac_address.to_string())
+                    .field("temperature", data.temperature as f64)
+                    .field("humidity", data.humidity as f64)
+                    .field("pressure", data.pressure as i64)
+                    .field("acceleration_x", data.acceleration_x as f64)
+                    .field("acceleration_y", data.acceleration_y as f64)
+                    .field("acceleration_z", data.acceleration_z as f64)
+                    .field("voltage", data.voltage as f64)
+                    .field("tx_power", data.tx_power as i64)
+                    .field("movement_counter", data.movement_counter as i64)
+                    .field("measurement_sequence", data.measurement_sequence as i64)
+                    .build()?,
+            );
+        }
+        println!("Sending data ({} points)...", points.len());
+        self.influx_client
+            .write(&self.influx_bucket, stream::iter(points))
+            .await?;
+        Ok(())
+    }
 }
 
-async fn read_data(ruuvis: &Vec::<btleplug::platform::Peripheral>) {
-    for ruuvi in ruuvis.iter() {
-        if let Ok(mut notification) = ruuvi.notifications().await {
-            if let Some(data) = notification.next().await {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    pretty_env_logger::init();
+    dotenv().ok();
+    
+    let config: Config = serde_json::from_str(&fs::read_to_string("config.json").await.unwrap()).unwrap(); 
 
-                println!(
-                    "{}",
-                    RuuviData::new(ruuvi.address(), data.value.clone()).unwrap()
-                );
-            }
-        }
-    }
+    let mut rs = RustSniffer::new(config).await;
+    rs.start().await
 }
