@@ -3,21 +3,23 @@ use btleplug::api::{BDAddr, Central, CharPropFlags, Manager as _, Peripheral, Sc
 use btleplug::platform::Manager;
 use core::{f64, fmt};
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 use dotenv::dotenv;
 use futures::stream::{self, StreamExt};
 use influxdb2::Client;
 use std::error::Error;
-use std::time::Duration;
-use tokio::{fs, time};
 use uuid::Uuid;
 use serde::Deserialize;
 use serde_json;
+use std::fs;
+use tokio::time::{sleep, sleep_until};
 
 /// UUID of the characteristic for which we should subscribe to notifications.
 const NOTIFY_CHARACTERISTIC_UUID: Uuid = Uuid::from_u128(0x6e400003_b5a3_f393_e0a9_e50e24dcca9e);
 
 #[derive(Debug)]
 struct RuuviData {
+    name: String,
     mac_address: BDAddr,
     temperature: f32,
     humidity: f32,
@@ -32,7 +34,7 @@ struct RuuviData {
 }
 
 impl RuuviData {
-    fn new(mac_address: BDAddr, raw_data: Vec<u8>) -> Result<RuuviData, Box<dyn Error>> {
+    fn new(name: String, mac_address: BDAddr, raw_data: Vec<u8>) -> Result<RuuviData, Box<dyn Error>> {
         let mut reader = BitReader::new(&raw_data);
         reader.skip(8).unwrap();
 
@@ -48,6 +50,7 @@ impl RuuviData {
         let measurement_sequence = reader.read_u16(16)?;
 
         Ok(RuuviData {
+            name,
             mac_address,
             temperature,
             humidity,
@@ -75,17 +78,21 @@ impl fmt::Display for RuuviData {
 #[derive(Deserialize)]
 struct Config {
     influx_bucket: String,
+    influx_measurement: String,
     influx_host: String,
     influx_org: String,
     influx_token: String,
     tags: HashMap<String, String>,
+    delay_in_secs: u32,
 }
 
 struct RustSniffer {
     influx_client: Client,
     influx_bucket: String,
+    influx_measurement: String,
     tag_names: HashMap<String, BDAddr>,
-    ruuvis: Vec<btleplug::platform::Peripheral>,
+    ruuvis: HashMap<String, btleplug::platform::Peripheral>,
+    delay: u32,
 }
 
 impl RustSniffer {
@@ -100,8 +107,10 @@ impl RustSniffer {
         RustSniffer {
             influx_client: Client::new(config.influx_host, config.influx_org, config.influx_token),
             influx_bucket: config.influx_bucket,
-            ruuvis: Vec::new(),
+            influx_measurement: config.influx_measurement,
+            ruuvis: HashMap::new(),
             tag_names,
+            delay: config.delay_in_secs,
         }
     }
 
@@ -124,18 +133,18 @@ impl RustSniffer {
                 if self.tag_names.len() == self.ruuvis.len() {
                     break;
                 }
-                time::sleep(Duration::from_secs(1)).await;
+                sleep(Duration::from_secs(1)).await;
                 let peripherals = adapter_list[0].peripherals().await?;
 
-                for (_name, mac) in &self.tag_names {
+                for (name, mac) in &self.tag_names {
                     for peripheral in &peripherals {
                         if peripheral.address() == *mac {
                             if !self.ruuvis
                                 .iter()
-                                .any(|ruuvi| ruuvi.address() == peripheral.address())
+                                .any(|ruuvi| ruuvi.1.address() == peripheral.address())
                             {
                                 println!("found {}", mac);
-                                self.ruuvis.push(peripheral.clone());
+                                self.ruuvis.insert(name.to_string(), peripheral.clone());
                             }
                         }
                     }
@@ -143,7 +152,7 @@ impl RustSniffer {
             }
         }
         println!("Connecting and subscribing..");
-        for ruuvi in self.ruuvis.iter() {
+        for (_name, ruuvi) in self.ruuvis.iter() {
             ruuvi.connect().await?;
             ruuvi.discover_services().await?;
             for characteristic in ruuvi.characteristics() {
@@ -164,15 +173,21 @@ impl RustSniffer {
     }
 
     async fn start(&mut self) -> Result<(), Box<dyn Error>> {
-        self.discover().await?;
-        println!("\nStarting polling notifications..");
-        use std::time::Instant;
+        println!("Starting, trying to connect to all tags...");
         loop {
-            let now = Instant::now();
+            match self.discover().await {
+                Ok(_) => break,
+                Err(_) => {
+                    println!("Discovery failed, retrying...");
+                    sleep(Duration::from_secs(1)).await;
+                },
+            }
+        }
+        println!("\nStarting polling notifications..");
+        loop {
+            let continue_time = Instant::now() + Duration::from_secs(self.delay.into());
             self.update_data().await?;
-            time::sleep(Duration::from_secs(10)).await;
-            let elapsed = now.elapsed();
-            println!("Elapsed: {:.2?}", elapsed);
+            sleep_until(continue_time.into()).await;
         }
     }
 
@@ -181,10 +196,10 @@ impl RustSniffer {
     ) -> Result<(), Box<dyn Error>> {
         println!("Reading data...");
         let mut ruuvi_datas: Vec<RuuviData> = Vec::new();
-        for ruuvi in self.ruuvis.iter() {
+        for (name, ruuvi) in self.ruuvis.iter() {
             if let Ok(mut notification) = ruuvi.notifications().await {
                 if let Some(data) = notification.next().await {
-                    ruuvi_datas.push(RuuviData::new(ruuvi.address(), data.value.clone()).unwrap());
+                    ruuvi_datas.push(RuuviData::new(name.to_string(), ruuvi.address(), data.value.clone()).unwrap());
                 }
             }
         }
@@ -198,7 +213,8 @@ impl RustSniffer {
         let mut points: Vec<DataPoint> = Vec::new();
         for data in ruuvi_datas {
             points.push(
-                DataPoint::builder("ruuvi_measurements_test")
+                DataPoint::builder(self.influx_measurement.clone())
+                    .tag("name", data.name)
                     .tag("mac", data.mac_address.to_string())
                     .field("temperature", data.temperature as f64)
                     .field("humidity", data.humidity as f64)
@@ -226,7 +242,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     pretty_env_logger::init();
     dotenv().ok();
     
-    let config: Config = serde_json::from_str(&fs::read_to_string("config.json").await.unwrap()).unwrap(); 
+    let config: Config = serde_json::from_str(&fs::read_to_string("config.json").unwrap()).unwrap(); 
 
     let mut rs = RustSniffer::new(config).await;
     rs.start().await

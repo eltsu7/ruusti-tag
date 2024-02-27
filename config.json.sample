@@ -1,10 +1,12 @@
 {
 	"influx_bucket": "",
+	"influx_measurement": "",
 	"influx_host": "",
 	"influx_org": "",
 	"influx_token": "",
 	"tags": {
 		"Tag name 1": "MAC:1",
 		"Tag name 2": "MAC:2"
-	}
+	},
+	"delay_in_secs": 30
 }
