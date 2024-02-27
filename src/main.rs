@@ -203,6 +203,7 @@ impl RustSniffer {
                 }
             }
         }
+        println!("Successfully read {} points.", ruuvi_datas.len());
         self.send_data(ruuvi_datas).await?;
         Ok(())
     }
