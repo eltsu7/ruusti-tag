@@ -150,6 +150,7 @@ impl RustSniffer {
                     }
                 }
             }
+            adapter.stop_scan().await?;
         }
         println!("Connecting and subscribing..");
         for (_name, ruuvi) in self.ruuvis.iter() {
