@@ -2,17 +2,17 @@ use bitreader::BitReader;
 use btleplug::api::{BDAddr, Central, CharPropFlags, Manager as _, Peripheral, ScanFilter};
 use btleplug::platform::Manager;
 use core::{f64, fmt};
-use std::collections::HashMap;
-use std::time::{Duration, Instant};
 use dotenv::dotenv;
 use futures::stream::{self, StreamExt};
 use influxdb2::Client;
-use std::error::Error;
-use uuid::Uuid;
 use serde::Deserialize;
 use serde_json;
+use std::collections::HashMap;
+use std::error::Error;
 use std::fs;
+use std::time::{Duration, Instant};
 use tokio::time::{sleep, sleep_until};
+use uuid::Uuid;
 
 /// UUID of the characteristic for which we should subscribe to notifications.
 const NOTIFY_CHARACTERISTIC_UUID: Uuid = Uuid::from_u128(0x6e400003_b5a3_f393_e0a9_e50e24dcca9e);
@@ -34,7 +34,11 @@ struct RuuviData {
 }
 
 impl RuuviData {
-    fn new(name: String, mac_address: BDAddr, raw_data: Vec<u8>) -> Result<RuuviData, Box<dyn Error>> {
+    fn new(
+        name: String,
+        mac_address: BDAddr,
+        raw_data: Vec<u8>,
+    ) -> Result<RuuviData, Box<dyn Error>> {
         let mut reader = BitReader::new(&raw_data);
         reader.skip(8).unwrap();
 
@@ -101,8 +105,7 @@ impl RustSniffer {
 
         for (name, mac) in config.tags {
             tag_names.insert(name, BDAddr::from_str_delim(&mac).unwrap());
-        };
-
+        }
 
         RustSniffer {
             influx_client: Client::new(config.influx_host, config.influx_org, config.influx_token),
@@ -114,7 +117,7 @@ impl RustSniffer {
         }
     }
 
-    async fn discover(&mut self) -> Result<(), Box<dyn Error>>{
+    async fn discover(&mut self) -> Result<(), Box<dyn Error>> {
         let manager = Manager::new().await?;
         let adapter_list = manager.adapters().await?;
         if adapter_list.is_empty() {
@@ -139,7 +142,8 @@ impl RustSniffer {
                 for (name, mac) in &self.tag_names {
                     for peripheral in &peripherals {
                         if peripheral.address() == *mac {
-                            if !self.ruuvis
+                            if !self
+                                .ruuvis
                                 .iter()
                                 .any(|ruuvi| ruuvi.1.address() == peripheral.address())
                             {
@@ -181,7 +185,7 @@ impl RustSniffer {
                 Err(_) => {
                     println!("Discovery failed, retrying...");
                     sleep(Duration::from_secs(1)).await;
-                },
+                }
             }
         }
         println!("\nStarting polling notifications..");
@@ -190,19 +194,22 @@ impl RustSniffer {
             if let Err(err) = self.update_data().await {
                 println!("Error in update loop: {}", err)
             }
+            println!("Next update in {:?}.", continue_time - Instant::now());
             sleep_until(continue_time.into()).await;
         }
     }
 
-    async fn update_data(
-        &self
-    ) -> Result<(), Box<dyn Error>> {
+    async fn update_data(&self) -> Result<(), Box<dyn Error>> {
         println!("Reading data...");
         let mut ruuvi_datas: Vec<RuuviData> = Vec::new();
         for (name, ruuvi) in self.ruuvis.iter() {
+            ruuvi.connect().await?; // Needed in linux for some reason
             if let Ok(mut notification) = ruuvi.notifications().await {
                 if let Some(data) = notification.next().await {
-                    ruuvi_datas.push(RuuviData::new(name.to_string(), ruuvi.address(), data.value.clone()).unwrap());
+                    ruuvi_datas.push(
+                        RuuviData::new(name.to_string(), ruuvi.address(), data.value.clone())
+                            .unwrap(),
+                    );
                 }
             }
         }
@@ -247,8 +254,8 @@ impl RustSniffer {
 async fn main() -> Result<(), Box<dyn Error>> {
     pretty_env_logger::init();
     dotenv().ok();
-    
-    let config: Config = serde_json::from_str(&fs::read_to_string("config.json").unwrap()).unwrap(); 
+
+    let config: Config = serde_json::from_str(&fs::read_to_string("config.json").unwrap()).unwrap();
 
     let mut rs = RustSniffer::new(config).await;
     rs.start().await
