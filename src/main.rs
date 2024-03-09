@@ -187,7 +187,9 @@ impl RustSniffer {
         println!("\nStarting polling notifications..");
         loop {
             let continue_time = Instant::now() + Duration::from_secs(self.delay.into());
-            self.update_data().await?;
+            if let Err(err) = self.update_data().await {
+                println!("Error in update loop: {}", err)
+            }
             sleep_until(continue_time.into()).await;
         }
     }
@@ -205,7 +207,9 @@ impl RustSniffer {
             }
         }
         println!("Successfully read {} points.", ruuvi_datas.len());
-        self.send_data(ruuvi_datas).await?;
+        if let Err(err) = self.send_data(ruuvi_datas).await {
+            println!("Error while sending data: {}", err)
+        }
         Ok(())
     }
 
