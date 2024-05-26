@@ -182,8 +182,8 @@ impl RustSniffer {
         loop {
             match self.discover().await {
                 Ok(_) => break,
-                Err(_) => {
-                    println!("Discovery failed, retrying...");
+                Err(err) => {
+                    println!("Discovery failed ({}), retrying...", err);
                     sleep(Duration::from_secs(1)).await;
                 }
             }
